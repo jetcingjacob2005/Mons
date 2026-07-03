@@ -28,6 +28,7 @@ the result to discord_results_log.csv for your records.
 import discord
 import os
 import csv
+import asyncio
 from datetime import datetime, timezone
 
 from mars_checker import process_image_bytes
@@ -41,6 +42,7 @@ if not TOKEN:
 
 LOG_CSV    = "discord_results_log.csv"
 IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp")
+REQUIRED_TAG = "#ge-sp-marstrek"  # image must be posted with this tag to be checked
 
 FIELDNAMES = [
     "timestamp", "discord_user", "channel", "file",
@@ -109,15 +111,31 @@ async def on_message(message: discord.Message):
     if message.author.bot:
         return
 
-    for attachment in message.attachments:
-        if not attachment.filename.lower().endswith(IMAGE_EXTS):
-            continue
+    # Only react to images posted with the required tag anywhere in the message
+    if REQUIRED_TAG not in message.content.lower():
+        return
 
+    image_attachments = [
+        a for a in message.attachments if a.filename.lower().endswith(IMAGE_EXTS)
+    ]
+    if not image_attachments:
+        await message.channel.send(
+            f"{message.author.mention} I see `{REQUIRED_TAG}` but no image attached — "
+            "attach your screenshot in the same message."
+        )
+        return
+
+    for attachment in image_attachments:
         status_msg = await message.channel.send(f"🔎 Checking `{attachment.filename}`...")
 
         try:
             image_bytes = await attachment.read()
-            result = process_image_bytes(image_bytes, attachment.filename)
+            # Gemini's SDK call is blocking/synchronous — run it in a thread
+            # so it doesn't freeze Discord's event loop (which causes
+            # missed heartbeats and disconnects on slower responses).
+            result = await asyncio.to_thread(
+                process_image_bytes, image_bytes, attachment.filename
+            )
         except Exception as e:
             await status_msg.edit(content=f"⚠️ Could not process `{attachment.filename}`: {e}")
             continue
