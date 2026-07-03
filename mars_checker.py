@@ -19,13 +19,6 @@ from google.api_core.exceptions import ResourceExhausted
 # ============================================================
 API_KEY = os.environ.get("GEMINI_API_KEY", "")
 
-# TEMPORARY DEBUG — remove once the key issue is confirmed fixed
-print("DEBUG: env vars visible to this process:")
-for k in sorted(os.environ.keys()):
-    if "KEY" in k or "TOKEN" in k:
-        print(f"  {k} = {'<set, length ' + str(len(os.environ[k])) + '>' if os.environ[k] else '<EMPTY>'}")
-    
-
 # Fallback: load from a local .env file if present (format: GEMINI_API_KEY=xxxx)
 if not API_KEY and os.path.exists(".env"):
     with open(".env", "r", encoding="utf-8") as env_file:
