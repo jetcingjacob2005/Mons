@@ -25,8 +25,11 @@ it in memory, runs it through the same classifier as the batch script,
 replies with an approved/rejected embed + reasons, and appends the
 result to discord_results_log.csv.
 
-Anyone can type "!export" in any channel to get that CSV file sent
-back to them directly in Discord — open it in Excel/Google Sheets.
+Anyone can type "!export" in any channel, but only members with the
+"Mars Reviewer" role (or server Administrator permission) will
+actually receive the CSV file — everyone else gets a permission
+denied message. Change the required role name via the Railway
+variable AUTHORIZED_ROLE.
 
 PERSISTENT STORAGE (Railway)
 -----------------------------
@@ -61,6 +64,18 @@ LOG_CSV    = os.path.join(DATA_DIR, "discord_results_log.csv")
 IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp")
 REQUIRED_TAG   = "#ge-sp-marstrek"  # image must be posted with this tag to be checked
 EXPORT_COMMAND = "!export"          # posting this sends the current log as a file
+
+# Only members with this role (or server Administrator permission) can !export.
+# Set via Railway variable AUTHORIZED_ROLE — must match the role name exactly
+# (case-insensitive). Create this role in each server and assign it to
+# whoever should be able to see the data.
+AUTHORIZED_ROLE = os.environ.get("AUTHORIZED_ROLE", "Mars Reviewer")
+
+
+def is_authorized(member: discord.Member) -> bool:
+    if member.guild_permissions.administrator:
+        return True
+    return any(role.name.lower() == AUTHORIZED_ROLE.lower() for role in member.roles)
 
 FIELDNAMES = [
     "timestamp", "discord_user", "channel", "file",
@@ -129,8 +144,16 @@ async def on_message(message: discord.Message):
     if message.author.bot:
         return
 
-    # Anyone can post !export to get the current log as a downloadable file
+    # Anyone can post !export to get the current log as a downloadable file —
+    # but only authorized members are allowed to actually receive it
     if message.content.strip().lower() == EXPORT_COMMAND:
+        if not isinstance(message.author, discord.Member) or not is_authorized(message.author):
+            await message.channel.send(
+                f"{message.author.mention} you don't have permission to export "
+                "this data. Ask an admin for the "
+                f"**{AUTHORIZED_ROLE}** role if you need access."
+            )
+            return
         if not os.path.exists(LOG_CSV):
             await message.channel.send("No results logged yet.")
             return
