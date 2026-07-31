@@ -20,10 +20,23 @@ SETUP
 WHAT IT DOES
 ------------
 Watches every channel the bot can see. Whenever someone posts an image
-attachment (.png/.jpg/.jpeg/.webp), the bot downloads it in memory,
-runs it through the same classifier as the batch script, replies in
-the channel with an approved/rejected embed + reasons, and appends
-the result to discord_results_log.csv for your records.
+attachment with #ge-sp-marstrek in the same message, the bot downloads
+it in memory, runs it through the same classifier as the batch script,
+replies with an approved/rejected embed + reasons, and appends the
+result to discord_results_log.csv.
+
+Anyone can type "!export" in any channel to get that CSV file sent
+back to them directly in Discord — open it in Excel/Google Sheets.
+
+PERSISTENT STORAGE (Railway)
+-----------------------------
+By default the CSV lives inside the container's filesystem, which is
+WIPED on every redeploy/restart. To keep your log permanently:
+  1. In Railway, open your service -> Settings -> Volumes -> Add Volume
+  2. Set the mount path to /data
+  3. Add an environment variable: DATA_DIR = /data
+  4. Redeploy
+From then on the CSV survives restarts and redeploys.
 """
 import discord
 import os
@@ -40,9 +53,14 @@ if not TOKEN:
         "variable before running this script."
     )
 
-LOG_CSV    = "discord_results_log.csv"
+# DATA_DIR lets you point the CSV at a persistent Railway Volume instead of
+# the container's throwaway filesystem — see setup notes above.
+DATA_DIR = os.environ.get("DATA_DIR", ".")
+os.makedirs(DATA_DIR, exist_ok=True)
+LOG_CSV    = os.path.join(DATA_DIR, "discord_results_log.csv")
 IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp")
-REQUIRED_TAG = "#ge-sp-marstrek"  # image must be posted with this tag to be checked
+REQUIRED_TAG   = "#ge-sp-marstrek"  # image must be posted with this tag to be checked
+EXPORT_COMMAND = "!export"          # posting this sends the current log as a file
 
 FIELDNAMES = [
     "timestamp", "discord_user", "channel", "file",
@@ -109,6 +127,17 @@ async def on_ready():
 @client.event
 async def on_message(message: discord.Message):
     if message.author.bot:
+        return
+
+    # Anyone can post !export to get the current log as a downloadable file
+    if message.content.strip().lower() == EXPORT_COMMAND:
+        if not os.path.exists(LOG_CSV):
+            await message.channel.send("No results logged yet.")
+            return
+        await message.channel.send(
+            content=f"{message.author.mention} here's the current results log:",
+            file=discord.File(LOG_CSV, filename="discord_results_log.csv"),
+        )
         return
 
     # Only react to images posted with the required tag anywhere in the message
