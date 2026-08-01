@@ -31,6 +31,13 @@ actually receive the CSV file — everyone else gets a permission
 denied message. Change the required role name via the Railway
 variable AUTHORIZED_ROLE.
 
+Every APPROVED submission also gets auto-posted to a review channel
+(default name "admin-review", set via ADMIN_REVIEW_CHANNEL) so admins
+don't have to hunt through the main channel. Admins award points with:
+  !karma @user 50 [optional reason]
+which is logged to karma_log.csv and totals are tracked per user.
+Check someone's total with: !karma @user
+
 PERSISTENT STORAGE (Railway)
 -----------------------------
 By default the CSV lives inside the container's filesystem, which is
@@ -45,6 +52,7 @@ import discord
 import os
 import csv
 import asyncio
+import re
 from datetime import datetime, timezone
 
 from mars_checker import process_image_bytes
@@ -60,10 +68,17 @@ if not TOKEN:
 # the container's throwaway filesystem — see setup notes above.
 DATA_DIR = os.environ.get("DATA_DIR", ".")
 os.makedirs(DATA_DIR, exist_ok=True)
-LOG_CSV    = os.path.join(DATA_DIR, "discord_results_log.csv")
-IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp")
+LOG_CSV      = os.path.join(DATA_DIR, "discord_results_log.csv")
+KARMA_CSV    = os.path.join(DATA_DIR, "karma_log.csv")
+IMAGE_EXTS   = (".png", ".jpg", ".jpeg", ".webp")
 REQUIRED_TAG   = "#ge-sp-marstrek"  # image must be posted with this tag to be checked
 EXPORT_COMMAND = "!export"          # posting this sends the current log as a file
+KARMA_COMMAND  = "!karma"           # !karma @user 50 [reason]  or  !karma @user (to check total)
+
+# Approved submissions get auto-posted here for admin review.
+# Set via Railway variable ADMIN_REVIEW_CHANNEL — must match the channel
+# name exactly (without the #). Create this channel in each server.
+ADMIN_REVIEW_CHANNEL = os.environ.get("ADMIN_REVIEW_CHANNEL", "admin-review")
 
 # Only members with this role (or server Administrator permission) can !export.
 # Set via Railway variable AUTHORIZED_ROLE — must match the role name exactly
@@ -107,11 +122,67 @@ def log_result(user: str, channel: str, result: dict) -> None:
         writer.writerow(row)
 
 
+KARMA_FIELDNAMES = ["timestamp", "discord_user_id", "discord_user", "points", "awarded_by", "reason"]
+
+
+def award_karma(user_id: int, user_display: str, points: int, awarded_by: str, reason: str) -> int:
+    """Appends a karma award and returns the user's new running total."""
+    file_exists = os.path.exists(KARMA_CSV)
+    with open(KARMA_CSV, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=KARMA_FIELDNAMES)
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow({
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "discord_user_id": user_id,
+            "discord_user": user_display,
+            "points": points,
+            "awarded_by": awarded_by,
+            "reason": reason,
+        })
+    return get_karma_total(user_id)
+
+
+def get_karma_total(user_id: int) -> int:
+    if not os.path.exists(KARMA_CSV):
+        return 0
+    total = 0
+    with open(KARMA_CSV, newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            if row.get("discord_user_id") == str(user_id):
+                try:
+                    total += int(row.get("points", 0))
+                except ValueError:
+                    pass
+    return total
+
+
+def build_review_embed(result: dict, submitter: discord.Member) -> discord.Embed:
+    embed = discord.Embed(
+        title="🔔 Pending Karma Review",
+        description=f"Submitted by {submitter.mention}\nFile: `{result['file']}`",
+        color=discord.Color.gold(),
+    )
+    embed.add_field(
+        name="Terrain distance",
+        value=f"{result['terrain_distance_km']} km" if result["terrain_distance_km"] is not None else "—",
+        inline=True,
+    )
+    embed.add_field(
+        name="Lat / Lon",
+        value=f"{result['latitude']} / {result['longitude']}",
+        inline=True,
+    )
+    embed.set_footer(text=f"Award points with: !karma @{submitter.display_name} <points>")
+    return embed
+
+
 def build_embed(result: dict) -> discord.Embed:
     approved = result["decision"] == "approved"
     embed = discord.Embed(
-        title=f"{'✅ Approved' if approved else '❌ Rejected'} — {result['file']}",
-        color=discord.Color.green() if approved else discord.Color.red(),
+        title=f"{'⏳ Initiated for Approval' if approved else '❌ Rejected'} — {result['file']}",
+        description="All checks passed — sent to admins for karma review." if approved else None,
+        color=discord.Color.gold() if approved else discord.Color.red(),
     )
     embed.add_field(
         name="Terrain distance",
@@ -142,6 +213,46 @@ async def on_ready():
 @client.event
 async def on_message(message: discord.Message):
     if message.author.bot:
+        return
+
+    # !karma @user 50 [reason]   -> award points (authorized only)
+    # !karma @user               -> check their current total (anyone)
+    if message.content.strip().lower().startswith(KARMA_COMMAND):
+        if not message.mentions:
+            await message.channel.send(
+                f"Usage: `{KARMA_COMMAND} @user <points> [reason]` to award, "
+                f"or `{KARMA_COMMAND} @user` to check their total."
+            )
+            return
+        target = message.mentions[0]
+        rest = message.content.split(target.mention, 1)[-1].strip()
+        # also handle the plain <@id> mention form discord.py may not have stripped
+        rest = re.sub(r"^<@!?\d+>\s*", "", rest).strip()
+
+        if not rest:
+            total = get_karma_total(target.id)
+            await message.channel.send(f"{target.mention} has **{total} karma** points.")
+            return
+
+        if not isinstance(message.author, discord.Member) or not is_authorized(message.author):
+            await message.channel.send(
+                f"{message.author.mention} only reviewers can award karma. Ask an admin "
+                f"for the **{AUTHORIZED_ROLE}** role if you need access."
+            )
+            return
+
+        match = re.match(r"([+-]?\d+)\s*(.*)", rest)
+        if not match:
+            await message.channel.send(f"Couldn't read a point value from `{rest}`.")
+            return
+        points = int(match.group(1))
+        reason = match.group(2).strip()
+
+        new_total = award_karma(target.id, str(target), points, str(message.author), reason)
+        await message.channel.send(
+            f"✅ Awarded **{points} karma** to {target.mention}"
+            f"{f' — {reason}' if reason else ''}. New total: **{new_total}**."
+        )
         return
 
     # Anyone can post !export to get the current log as a downloadable file —
@@ -198,6 +309,17 @@ async def on_message(message: discord.Message):
             content=f"{message.author.mention}",
             embed=build_embed(result),
         )
+
+        if result["decision"] == "approved" and isinstance(message.author, discord.Member):
+            review_channel = discord.utils.get(
+                message.guild.text_channels, name=ADMIN_REVIEW_CHANNEL
+            )
+            if review_channel is not None:
+                await review_channel.send(
+                    embed=build_review_embed(result, message.author)
+                )
+            # if the channel doesn't exist in this server, silently skip —
+            # doesn't block the user-facing flow
 
 
 if __name__ == "__main__":
