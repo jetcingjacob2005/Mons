@@ -32,11 +32,17 @@ denied message. Change the required role name via the Railway
 variable AUTHORIZED_ROLE.
 
 Every APPROVED submission also gets auto-posted to a review channel
-(default name "admin-review", set via ADMIN_REVIEW_CHANNEL) so admins
-don't have to hunt through the main channel. Admins award points with:
-  !karma @user 50 [optional reason]
-which is logged to karma_log.csv and totals are tracked per user.
-Check someone's total with: !karma @user
+(default name "admin-review", set via ADMIN_REVIEW_CHANNEL) with the
+submitted image shown inline, plus two buttons:
+  - "Approve +100 Karma" -> awards DEFAULT_KARMA_POINTS to the
+    submitter automatically (no typing needed)
+  - "Flag as Rejected" -> marks it reviewed with no karma awarded
+Only members with AUTHORIZED_ROLE (or Administrator) can click these.
+Change the point value via the Railway variable DEFAULT_KARMA_POINTS.
+
+Admins can still manually award/check karma with:
+  !karma @user 50 [optional reason]   (award — authorized only)
+  !karma @user                        (check total — anyone)
 
 PERSISTENT STORAGE (Railway)
 -----------------------------
@@ -85,6 +91,11 @@ ADMIN_REVIEW_CHANNEL = os.environ.get("ADMIN_REVIEW_CHANNEL", "admin-review")
 # (case-insensitive). Create this role in each server and assign it to
 # whoever should be able to see the data.
 AUTHORIZED_ROLE = os.environ.get("AUTHORIZED_ROLE", "Mars Reviewer")
+
+# Points auto-awarded when an admin clicks "Approve" in the review channel.
+# Set via Railway variable DEFAULT_KARMA_POINTS.
+DEFAULT_KARMA_POINTS = int(os.environ.get("DEFAULT_KARMA_POINTS", "100"))
+
 
 
 def is_authorized(member: discord.Member) -> bool:
@@ -157,7 +168,7 @@ def get_karma_total(user_id: int) -> int:
     return total
 
 
-def build_review_embed(result: dict, submitter: discord.Member) -> discord.Embed:
+def build_review_embed(result: dict, submitter: discord.Member, attachment: discord.Attachment) -> discord.Embed:
     embed = discord.Embed(
         title="🔔 Pending Karma Review",
         description=f"Submitted by {submitter.mention}\nFile: `{result['file']}`",
@@ -173,8 +184,70 @@ def build_review_embed(result: dict, submitter: discord.Member) -> discord.Embed
         value=f"{result['latitude']} / {result['longitude']}",
         inline=True,
     )
-    embed.set_footer(text=f"Award points with: !karma @{submitter.display_name} <points>")
+    embed.set_image(url=attachment.url)
     return embed
+
+
+class ReviewView(discord.ui.View):
+    """Buttons shown under a pending-review post. No slash/text commands needed."""
+
+    def __init__(self, submitter_id: int, submitter_display: str, filename: str):
+        super().__init__(timeout=None)
+        self.submitter_id = submitter_id
+        self.submitter_display = submitter_display
+        self.filename = filename
+        self.resolved = False
+
+    async def _check_authorized(self, interaction: discord.Interaction) -> bool:
+        if not isinstance(interaction.user, discord.Member) or not is_authorized(interaction.user):
+            await interaction.response.send_message(
+                f"Only members with the **{AUTHORIZED_ROLE}** role can review submissions.",
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    @discord.ui.button(label=f"Approve +{DEFAULT_KARMA_POINTS} Karma", style=discord.ButtonStyle.success, emoji="✅")
+    async def approve(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.resolved:
+            await interaction.response.send_message("This submission was already reviewed.", ephemeral=True)
+            return
+        if not await self._check_authorized(interaction):
+            return
+        self.resolved = True
+        new_total = award_karma(
+            self.submitter_id, self.submitter_display, DEFAULT_KARMA_POINTS,
+            str(interaction.user), f"auto-approved via admin-review: {self.filename}",
+        )
+        for item in self.children:
+            item.disabled = True
+        embed = interaction.message.embeds[0]
+        embed.color = discord.Color.green()
+        embed.add_field(
+            name="Result",
+            value=f"✅ Approved by {interaction.user.mention} — +{DEFAULT_KARMA_POINTS} karma (new total: {new_total})",
+            inline=False,
+        )
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    @discord.ui.button(label="Flag as Rejected", style=discord.ButtonStyle.danger, emoji="❌")
+    async def reject(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.resolved:
+            await interaction.response.send_message("This submission was already reviewed.", ephemeral=True)
+            return
+        if not await self._check_authorized(interaction):
+            return
+        self.resolved = True
+        for item in self.children:
+            item.disabled = True
+        embed = interaction.message.embeds[0]
+        embed.color = discord.Color.red()
+        embed.add_field(
+            name="Result",
+            value=f"❌ Flagged as rejected by {interaction.user.mention} — no karma awarded",
+            inline=False,
+        )
+        await interaction.response.edit_message(embed=embed, view=self)
 
 
 def build_embed(result: dict) -> discord.Embed:
@@ -316,7 +389,8 @@ async def on_message(message: discord.Message):
             )
             if review_channel is not None:
                 await review_channel.send(
-                    embed=build_review_embed(result, message.author)
+                    embed=build_review_embed(result, message.author, attachment),
+                    view=ReviewView(message.author.id, str(message.author), result["file"]),
                 )
             # if the channel doesn't exist in this server, silently skip —
             # doesn't block the user-facing flow
