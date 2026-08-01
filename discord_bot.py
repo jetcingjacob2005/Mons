@@ -191,11 +191,12 @@ def build_review_embed(result: dict, submitter: discord.Member, attachment: disc
 class ReviewView(discord.ui.View):
     """Buttons shown under a pending-review post. No slash/text commands needed."""
 
-    def __init__(self, submitter_id: int, submitter_display: str, filename: str):
+    def __init__(self, submitter_id: int, submitter_display: str, filename: str, origin_channel: discord.TextChannel):
         super().__init__(timeout=None)
         self.submitter_id = submitter_id
         self.submitter_display = submitter_display
         self.filename = filename
+        self.origin_channel = origin_channel
         self.resolved = False
 
     async def _check_authorized(self, interaction: discord.Interaction) -> bool:
@@ -230,6 +231,13 @@ class ReviewView(discord.ui.View):
         )
         await interaction.response.edit_message(embed=embed, view=self)
 
+        if self.origin_channel is not None:
+            await self.origin_channel.send(
+                f"<@{self.submitter_id}> your submission `{self.filename}` was "
+                f"**approved** by {interaction.user.mention} — "
+                f"+{DEFAULT_KARMA_POINTS} karma awarded! New total: **{new_total}**."
+            )
+
     @discord.ui.button(label="Flag as Rejected", style=discord.ButtonStyle.danger, emoji="❌")
     async def reject(self, interaction: discord.Interaction, button: discord.ui.Button):
         if self.resolved:
@@ -248,6 +256,12 @@ class ReviewView(discord.ui.View):
             inline=False,
         )
         await interaction.response.edit_message(embed=embed, view=self)
+
+        if self.origin_channel is not None:
+            await self.origin_channel.send(
+                f"<@{self.submitter_id}> your submission `{self.filename}` was "
+                f"**flagged as rejected** by {interaction.user.mention} after admin review."
+            )
 
 
 def build_embed(result: dict) -> discord.Embed:
@@ -390,7 +404,7 @@ async def on_message(message: discord.Message):
             if review_channel is not None:
                 await review_channel.send(
                     embed=build_review_embed(result, message.author, attachment),
-                    view=ReviewView(message.author.id, str(message.author), result["file"]),
+                    view=ReviewView(message.author.id, str(message.author), result["file"], message.channel),
                 )
             # if the channel doesn't exist in this server, silently skip —
             # doesn't block the user-facing flow
