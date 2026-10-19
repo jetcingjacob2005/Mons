@@ -269,3 +269,36 @@ def process_image_bytes(image_bytes: bytes, filename: str = "uploaded_image.png"
     """Classify raw image bytes (e.g. a Discord attachment download)."""
     image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     return _run_model(image, filename)
+
+
+def process_general_evidence(image_bytes: bytes, filename: str, task_title: str, rules: str, member_name: str, muid: str = "") -> dict:
+    """Use Gemini as a constrained OCR/visual verifier for the non-Mars tasks."""
+    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    identity = f"Discord display name: {member_name}. Registered MuID: {muid or 'not supplied'}"
+    prompt = f"""You verify a MuLearn task submission. Task: {task_title}.\nRules: {rules}\n{identity}\nInspect the evidence carefully. Do not infer text that is not visible. A name match is case-insensitive and minor spacing differences are acceptable. Return only JSON: {{\"passed\": true/false, \"confidence\": 0-100, \"visible_identity\": \"text or null\", \"reasons\": [\"short reasons\"]}}"""
+    response = model.generate_content([prompt, image], generation_config={"temperature": 0.0})
+    raw = response.text.strip()
+    match = re.search(r"\{.*\}", re.sub(r"```json|```", "", raw), re.DOTALL)
+    if not match:
+        return {"file":filename,"decision":"rejected","all_messages":"The AI could not read a structured result; please resubmit a clearer evidence image.","confidence":0}
+    try:
+        data=json.loads(match.group())
+        reasons=data.get("reasons",[])
+        return {"file":filename,"decision":"approved" if data.get("passed") else "rejected","all_messages":" | ".join(str(x) for x in reasons),"confidence":int(data.get("confidence",0)),"visible_identity":data.get("visible_identity")}
+    except (ValueError, TypeError, json.JSONDecodeError):
+        return {"file":filename,"decision":"rejected","all_messages":"The AI response was invalid; please retry.","confidence":0}
+
+
+def process_text_evidence(url: str, text: str, task_title: str, rules: str, member_name: str, muid: str = "") -> dict:
+    prompt = f"""Verify this public MuLearn task evidence. Task: {task_title}. Rules: {rules}
+Discord display name: {member_name}; registered MuID: {muid or 'not supplied'}.
+Source URL: {url}
+Extracted public page text (may be incomplete): {text[:12000]}
+Return only JSON: {{"passed":true/false,"confidence":0-100,"reasons":["short reason"]}}. Never claim a fact absent from the supplied text."""
+    response = model.generate_content(prompt, generation_config={"temperature": 0.0})
+    raw=response.text.strip(); match=re.search(r"\{.*\}",re.sub(r"```json|```","",raw),re.DOTALL)
+    try:
+        data=json.loads(match.group()) if match else {}
+        return {"file":url,"decision":"approved" if data.get("passed") else "rejected","all_messages":" | ".join(str(x) for x in data.get("reasons",[])),"confidence":int(data.get("confidence",0))}
+    except (ValueError, TypeError, json.JSONDecodeError):
+        return {"file":url,"decision":"rejected","all_messages":"The linked page could not be verified.","confidence":0}

@@ -1,0 +1,7 @@
+.git
+.env
+*.db
+*.sqlite
+__pycache__
+*.py[cod]
+discord_results_log.csv
